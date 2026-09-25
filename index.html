@@ -273,8 +273,8 @@ input[type=color]::-webkit-color-swatch{border:0}
       <input type="range" id="wStiff" min="0" max="100" value="40">
       <div class="row grp"><label for="wBack">Paper back</label><span><input type="color" id="wBack" value="#f4f1ea"></span></div>
       <div class="row"><label class="toggle"><input type="checkbox" id="wSel">Selected strips only</label></div>
-      <div class="btns grp"><button class="btn solid" id="btnWind">Blow</button><button class="btn" id="btnFreeze" disabled>Freeze</button></div>
-      <p class="note">Export while the wind blows, or after Freeze, captures that moment.</p>
+      <div class="btns grp"><button class="btn solid" id="btnWind">Blow</button><button class="btn" id="btnFreeze" disabled>Freeze</button><button class="btn" id="btnWindReset" disabled>Reset</button></div>
+      <p class="note">Export while the wind blows, or after Freeze, captures that moment. Stop lets the strips settle; Reset lays them flat at once.</p>
     </div>
   </section>
   <section class="sec">
@@ -765,6 +765,12 @@ function startWind(){
   WIND.scope=scope; WIND.mode='run'; refreshWindUI(); kickWind();
 }
 function stopWind(){ if (WIND.mode==='off') return; WIND.mode='settle'; refreshWindUI(); kickWind(); }
+/* drop every simulation at once: back to the static arrangement, no settling */
+function resetWind(){
+  if (WIND.raf){ cancelAnimationFrame(WIND.raf); WIND.raf=0; }
+  for (const id of [...WIND.sims.keys()]) dropSim(id);
+  WIND.mode='off'; WIND.ramp=0; WIND.acc=0; WIND.scope=null; refreshWindUI();
+}
 function freezeWind(){
   if (WIND.mode==='run'){ WIND.mode='pause'; if (WIND.raf){ cancelAnimationFrame(WIND.raf); WIND.raf=0; } refreshWindUI(); draw(); }
   else if (WIND.mode==='pause'){ WIND.mode='run'; refreshWindUI(); kickWind(); }
@@ -774,6 +780,7 @@ function refreshWindUI(){
   $('btnWind').textContent = (m==='run'||m==='pause') ? 'Stop' : 'Blow';
   $('btnFreeze').disabled = !(m==='run'||m==='pause');
   $('btnFreeze').textContent = m==='pause' ? 'Resume' : 'Freeze';
+  $('btnWindReset').disabled = m==='off';
   $('windInfo').textContent = {off:'still',run:'blowing',pause:'frozen',settle:'settling'}[m];
   refreshStatus(); draw();
 }
@@ -1075,7 +1082,7 @@ function draw(){
     ox.strokeRect(a.x,a.y,b.x-a.x,b.y-a.y); ox.setLineDash([]);
     return;
   }
-  if (WIND.hover || windOn()) drawWindGuides(ink, paper);
+  if (WIND.hover && (WIND.mode==='off' || WIND.mode==='settle')) drawWindGuides(ink, paper);   // hidden while blowing or frozen
   const list = windOn() ? [] : selStrips();
   if (list.length){
     ox.save(); ox.translate(OFX,OFY); ox.scale(K,K);
@@ -1539,7 +1546,7 @@ wlive('wDir','dir',wArrow); wlive('wStr','strength'); wlive('wGust','gust'); wli
 $('wBack').oninput=e=>{ S.wind.back=e.target.value; draw(); }; $('wBack').onchange=()=>pushHist();
 $('wSel').onchange=e=>{ S.wind.selOnly=e.target.checked; if (WIND.mode==='run'||WIND.mode==='pause') WIND.scope = S.wind.selOnly ? new Set(SEL) : null; pushHist(); draw(); };
 $('btnWind').onclick=()=>{ (WIND.mode==='run'||WIND.mode==='pause') ? stopWind() : startWind(); };
-$('btnFreeze').onclick=freezeWind;
+$('btnFreeze').onclick=freezeWind; $('btnWindReset').onclick=resetWind;
 $('windSec').addEventListener('pointerenter',()=>{ WIND.hover=true; draw(); });
 $('windSec').addEventListener('pointerleave',()=>{ WIND.hover=false; draw(); });
 function syncControls(){
