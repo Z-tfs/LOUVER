@@ -591,11 +591,18 @@ function render(ctx, k, opts={}){
   }
   const pats = {};
   for (const sim of WIND.sims.values()) projectSim(sim);
-  const G = WIND.sims.size ? glPlan(ctx, k, order, opts.export) : null;
-  for (const s of order){
-    const im = imgById(s.img); if(!im) continue; ensureParams(im);
+  const useGL = WIND.sims.size>0 && glFits(ctx);
+  for (let oi=0; oi<order.length; oi++){
+    const s=order[oi], im = imgById(s.img); if(!im) continue; ensureParams(im);
     const sim = WIND.sims.get(s.id);
-    if (sim){ windShadow(ctx, k, im, sim); if (!(G && glComposite(G, s))) drawWindStrip(ctx, k, s, im, sim, opts); continue; }
+    if (sim){
+      if (useGL){   /* gather the whole run of consecutive blowing strips into one depth-tested pass */
+        const run=[]; let j=oi;
+        for (; j<order.length && WIND.sims.get(order[j].id); j++){ const m=imgById(order[j].img); if (m){ ensureParams(m); run.push({s:order[j], im:m, sim:WIND.sims.get(order[j].id)}); } }
+        if (glRun(ctx, k, run, opts.export)){ oi=j-1; continue; }
+      }
+      windShadow(ctx, k, im, sim); drawWindStrip(ctx, k, s, im, sim, opts); continue;
+    }
     const M = stripMatrix(s), p = pathOf(s);
     if (im.shOn && im.shAlpha>0){
       ctx.save(); ctx.translate(im.shDist*0.7, im.shDist); ctx.transform(M.a,M.b,M.c,M.d,M.e,M.f);
@@ -691,7 +698,7 @@ function stepSim(sim, s, amt){
   const w=S.wind, {n,p,q,r,pin,nrm,rw}=sim, t=WIND.t, dt=W_DT, dt2=dt*dt;
   if (sim.pinMode!==w.pin) setPins(sim);
   restOf(sim,s);
-  const st=w.stiff/100, kR=1.2+st*st*28, bend=0.04+st*0.5;
+  const st=w.stiff/100, kR=1.2+st*st*28, bend=0.08+st*0.7;
   const speed=amt*w.strength/100*1500, gust=w.gust/100;
   const th=w.dir*Math.PI/180, wx=Math.cos(th), wy=Math.sin(th);
   const swell=1+gust*0.8*Math.sin(t*0.83+sim.ph)*Math.sin(t*0.29+sim.ph*1.9);
@@ -709,12 +716,15 @@ function stepSim(sim, s, amt){
     p[k3]=px+vx*dt*0.985+ax*dt2; p[k3+1]=py+vy*dt*0.985+ay*dt2; p[k3+2]=pz+vz*dt*0.985+az*dt2;
   }
   const {ci,cl,ck}=sim, m=cl.length;
-  for (let it=0;it<6;it++) for (let c=0;c<m;c++){
+  for (let it=0;it<8;it++) for (let c=0;c<m;c++){
     const ia=ci[c*2], ib=ci[c*2+1], wa=pin[ia]?0:1, wb=pin[ib]?0:1; if(!(wa+wb)) continue;
     const a=ia*3, b=ib*3, dx=p[b]-p[a], dy=p[b+1]-p[a+1], dz=p[b+2]-p[a+2], L=Math.hypot(dx,dy,dz); if (L<1e-6) continue;
     const f=(L-cl[c])/L*(ck[c]<0?bend:ck[c])/(wa+wb);
     p[a]+=dx*f*wa; p[a+1]+=dy*f*wa; p[a+2]+=dz*f*wa; p[b]-=dx*f*wb; p[b+1]-=dy*f*wb; p[b+2]-=dz*f*wb;
   }
+}
+function finishSim(sim){
+  const {n,p,q,r}=sim;
   let dev=0, vel=0, zs=0;
   for (let k=0;k<n;k++){ const k3=k*3;
     if (p[k3+2]<0){ p[k3+2]=0; q[k3+2]=0; q[k3]+=(p[k3]-q[k3])*0.3; q[k3+1]+=(p[k3+1]-q[k3+1])*0.3; }   // the paper below stops it
@@ -723,21 +733,69 @@ function stepSim(sim, s, amt){
     zs+=p[k3+2]; }
   sim.avgZ=zs/n; sim.dev=dev; sim.vel=vel;
 }
+/* Strips keep their stacking where they overlap. Every strip sits GAP above the one below it
+   in the layer order (its "effective" height, z + rank·GAP), and wherever a particle of one
+   strip lies over or under a triangle of another, the two are held at least THICK apart in
+   height, on whichever side the particle was on the step before, so they can pass around
+   each other but not through. Heights only: a crude but cheap stand-in for real cloth contact. */
+const GAP=0.6, THICK=0.55, CELL=36;
+function collide(list){
+  if (list.length<2) return;
+  const grid=new Map(), key=(i,j)=>i*73856093^j*19349663;
+  list.forEach((sim,si)=>{ const {idx,p}=sim;
+    for (let t=0;t<idx.length;t+=3){
+      const a=idx[t]*3,b=idx[t+1]*3,c=idx[t+2]*3;
+      const i0=Math.floor(Math.min(p[a],p[b],p[c])/CELL), i1=Math.floor(Math.max(p[a],p[b],p[c])/CELL);
+      const j0=Math.floor(Math.min(p[a+1],p[b+1],p[c+1])/CELL), j1=Math.floor(Math.max(p[a+1],p[b+1],p[c+1])/CELL);
+      if ((i1-i0+1)*(j1-j0+1)>64) continue;              // a triangle seen edge-on: its heights are meaningless here
+      for (let i=i0;i<=i1;i++) for (let j=j0;j<=j1;j++){ const k=key(i,j); let e=grid.get(k); if(!e) grid.set(k,e=[]); e.push(si,t); }
+    } });
+  for (let it=0; it<2; it++) list.forEach((A,ai)=>{
+    const {p,q,pin,n}=A, zA0=A.rank*GAP;
+    for (let v=0; v<n; v++){
+      const v3=v*3, x=p[v3], y=p[v3+1], cand=grid.get(key(Math.floor(x/CELL),Math.floor(y/CELL))); if (!cand) continue;
+      for (let c=0;c<cand.length;c+=2){
+        const bi=cand[c]; if (bi===ai) continue;
+        const B=list[bi], t=cand[c+1], bp=B.p, bq=B.q, i0=B.idx[t], i1=B.idx[t+1], i2=B.idx[t+2], a=i0*3, b=i1*3, d=i2*3;
+        const ex=bp[b]-bp[a], ey=bp[b+1]-bp[a+1], fx=bp[d]-bp[a], fy=bp[d+1]-bp[a+1], det=ex*fy-fx*ey;
+        if (Math.abs(det)<1e-3) continue;
+        const gx=x-bp[a], gy=y-bp[a+1], w1=(gx*fy-fx*gy)/det, w2=(ex*gy-gx*ey)/det, w0=1-w1-w2;
+        if (w0<-0.01 || w1<-0.01 || w2<-0.01) continue;
+        const zB0=B.rank*GAP;
+        const zB=w0*bp[a+2]+w1*bp[b+2]+w2*bp[d+2]+zB0, zA=p[v3+2]+zA0;
+        const pB=w0*bq[a+2]+w1*bq[b+2]+w2*bq[d+2]+zB0, pA=q[v3+2]+zA0;
+        const side = Math.abs(pA-pB)>1e-4 ? Math.sign(pA-pB) : Math.sign(A.rank-B.rank)||1;
+        const viol=Math.min(THICK-side*(zA-zB), 3); if (viol<=0) continue;   // capped, so a deep overlap untangles over a few steps
+        const wa=pin[v]?0:1, wb=(B.pin[i0]?0:w0*w0)+(B.pin[i1]?0:w1*w1)+(B.pin[i2]?0:w2*w2), sum=wa+wb; if (!sum) continue;
+        const da=side*viol*wa/sum, db=side*viol/sum;
+        /* shift the previous positions too: contact displaces paper but must not fling it */
+        p[v3+2]+=da; q[v3+2]+=da;
+        if (!B.pin[i0]){ bp[a+2]-=db*w0; bq[a+2]-=db*w0; } if (!B.pin[i1]){ bp[b+2]-=db*w1; bq[b+2]-=db*w1; } if (!B.pin[i2]){ bp[d+2]-=db*w2; bq[d+2]-=db*w2; }
+      }
+    }
+  });
+}
 function dropSim(id){ const sim=WIND.sims.get(id); if (!sim) return; freeSprite(sim.sprite); WIND.sims.delete(id); }
 function windStep(){
   WIND.t+=W_DT;
   const target = WIND.mode==='run' ? 1 : 0;
   WIND.ramp = clamp(WIND.ramp + clamp(target-WIND.ramp, -W_DT/0.8, W_DT/1.2), 0, 1);
-  const live=new Set();
+  const live=new Set(), stepped=[];
+  const rank=new Map(S.strips.slice().sort((a,b)=>a.z-b.z).map((s,i)=>[s.id,i]));
   for (const s of S.strips){
     const inScope = WIND.mode==='run' && (!WIND.scope || WIND.scope.has(s.id));
     let sim=WIND.sims.get(s.id);
     if (!sim && !inScope) continue;
     if (!sim || sim.key!==simKey(s)){ dropSim(s.id); sim=buildSim(s); if(!sim) continue; WIND.sims.set(s.id,sim); }
     const amt = inScope ? WIND.ramp : (WIND.mode==='settle' ? WIND.ramp : 0);
-    stepSim(sim, s, amt);
-    if (amt<0.001 && sim.dev<0.4 && sim.vel<0.06){ dropSim(s.id); continue; }   // back flat: normal drawing again
-    live.add(s.id);
+    sim.rank=rank.get(s.id); sim.amt=amt;
+    stepSim(sim, s, amt); stepped.push([s.id,sim]); live.add(s.id);
+  }
+  /* only strips still in the wind collide: settling strips must be free to slide back into their own layer */
+  if (WIND.mode==='run') collide(stepped.map(e=>e[1]).filter(sim=>sim.amt>0.001));
+  for (const [id,sim] of stepped){
+    finishSim(sim);
+    if (sim.amt<0.001 && sim.dev<0.4 && sim.vel<0.06){ dropSim(id); live.delete(id); }   // back flat: normal drawing again
   }
   for (const id of [...WIND.sims.keys()]) if (!live.has(id)) dropSim(id);
   if (WIND.mode==='settle' && !WIND.sims.size){ WIND.mode='off'; refreshWindUI(); }
@@ -868,10 +926,38 @@ function drawWindStrip(ctx, k, s, im, sim, opts){
   for (const [q0] of cells){ tri(q0,q0+1,q0+C1+1); tri(q0,q0+C1+1,q0+C1); }
 }
 
-/* WebGL path for the live preview. Blowing strips are rendered into separate tiles of one
-   offscreen WebGL canvas (depth-tested, smooth-shaded, front or back texture by facing),
-   then each tile is composited into the 2D canvas at its place in the layer order. */
+/* WebGL path (preview, and exports that fit). Consecutive blowing strips in the layer order are
+   drawn together in one pass with a shared depth buffer, depth being each strip's effective
+   height (z + rank·GAP), so what is in front is decided per pixel and never flips between
+   frames. Shadows come from a shadow map: every strip is also drawn from the light, recording
+   the highest paper over each ground point; a pixel is shaded by paper above it on the light
+   side, softened with distance. Paper throws shadows on paper and, in a separate layer that is
+   blended into the canvas, on whatever lies underneath. */
 const GLW = { gl:null, cv:null, failed:false };
+const SHK=[0.45,0.6];                                   // how far a shadow slides per unit of height
+const GLSL_HEAD=`#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+`;
+/* shared shadow lookup: average occlusion over a small spiral of taps around map point c */
+const GLSL_SHADOW=`uniform sampler2D sm; uniform vec2 smSz; uniform float smK; uniform float blur; uniform float eps;
+float occAt(vec2 px, float z, out float oz){
+  vec4 m=texture2D(sm, vec2(px.x/smSz.x, 1.0-px.y/smSz.y));
+  oz=(m.r+m.g/255.0)*4000.0;
+  return (m.b>0.0 && oz>z+eps) ? m.b : 0.0;
+}
+float shadowAt(vec2 world, float z){
+  vec2 c=world*smK; float oz; float a=occAt(c,z,oz);
+  float dz = a>0.0 ? oz-z : 20.0;
+  float r=max(blur*(1.0+dz/60.0), 0.75);
+  float sum=a, w=1.0, o;
+  for (int i=0;i<16;i++){ float f=float(i); float ang=f*2.39996; float rad=r*sqrt((f+0.5)/16.0);
+    sum+=occAt(c+vec2(cos(ang),sin(ang))*rad, z, o); w+=1.0; }
+  return sum/w/(1.0+max(dz,0.0)/250.0);
+}
+`;
 function glInit(){
   if (GLW.gl && !GLW.gl.isContextLost()) return GLW.gl;
   if (GLW.failed) return null;
@@ -880,34 +966,42 @@ function glInit(){
     const gl=c.getContext('webgl',{premultipliedAlpha:true, preserveDrawingBuffer:true, antialias:false, depth:true, alpha:true});
     if (!gl) throw new Error('no webgl');
     const sh=(type,src)=>{ const o=gl.createShader(type); gl.shaderSource(o,src); gl.compileShader(o); if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
-    const pr=gl.createProgram();
-    gl.attachShader(pr, sh(gl.VERTEX_SHADER, `attribute vec3 p; attribute vec2 t; attribute vec3 n; uniform vec2 sz; varying vec2 vt; varying vec3 vn;
-      void main(){ vt=t; vn=n; gl_Position=vec4(p.x/sz.x*2.0-1.0, 1.0-p.y/sz.y*2.0, -p.z/4000.0, 1.0); }`));
-    gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, `#ifdef GL_FRAGMENT_PRECISION_HIGH
-      precision highp float;
-      #else
-      precision mediump float;
-      #endif
-      uniform sampler2D tf; uniform sampler2D tb; uniform float ccw; uniform vec3 L; varying vec2 vt; varying vec3 vn;
+    const prog=(vs,fs,attrs,unis)=>{ const pr=gl.createProgram(); gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs));
+      gl.linkProgram(pr); if (!gl.getProgramParameter(pr,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+      const o={pr}; for (const a of attrs) o[a]=gl.getAttribLocation(pr,a); for (const u of unis) o[u]=gl.getUniformLocation(pr,u); return o; };
+    /* vertex layout, 11 floats: device x,y · effective height · u,v · normal · world x,y,z */
+    GLW.strip=prog(`attribute vec2 sp; attribute float ze; attribute vec2 t; attribute vec3 n; attribute vec3 w;
+      uniform vec2 sz; varying vec2 vt; varying vec3 vn; varying vec3 vw; varying float vze;
+      void main(){ vt=t; vn=n; vw=w; vze=ze; gl_Position=vec4(sp.x/sz.x*2.0-1.0, 1.0-sp.y/sz.y*2.0, -ze/4000.0, 1.0); }`,
+      GLSL_HEAD+GLSL_SHADOW+`uniform sampler2D tf; uniform sampler2D tb; uniform float ccw; uniform vec3 L; uniform vec2 shk; uniform vec3 shCol; uniform float shOn;
+      varying vec2 vt; varying vec3 vn; varying vec3 vw; varying float vze;
       void main(){
         bool front = gl_FrontFacing == (ccw > 0.5);
         vec4 c = front ? texture2D(tf,vt) : texture2D(tb,vt);
         if (c.a < 0.004) discard;
         vec3 n = normalize(vn); if (n.z < 0.0) n = -n;
         float s = clamp((L.z-dot(n,L))*1.3, 0.0, 0.62) + (front ? 0.0 : 0.05);
-        gl_FragColor = vec4(c.rgb*(1.0-s), c.a);
-      }`));
-    gl.linkProgram(pr); if (!gl.getProgramParameter(pr,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
-    gl.useProgram(pr);
-    const L={}; for (const a of ['p','t','n']) L[a]=gl.getAttribLocation(pr,a); for (const u of ['sz','tf','tb','ccw','L']) L[u]=gl.getUniformLocation(pr,u);
-    GLW.vb=gl.createBuffer(); GLW.ib=gl.createBuffer(); GLW.loc=L;
-    gl.bindBuffer(gl.ARRAY_BUFFER,GLW.vb); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,GLW.ib);
-    gl.enableVertexAttribArray(L.p); gl.vertexAttribPointer(L.p,3,gl.FLOAT,false,32,0);
-    gl.enableVertexAttribArray(L.t); gl.vertexAttribPointer(L.t,2,gl.FLOAT,false,32,12);
-    gl.enableVertexAttribArray(L.n); gl.vertexAttribPointer(L.n,3,gl.FLOAT,false,32,20);
-    gl.uniform1i(L.tf,0); gl.uniform1i(L.tb,1); gl.uniform3f(L.L,...LIGHT);
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,true);
-    gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA); gl.clearColor(0,0,0,0);
+        vec3 col = c.rgb*(1.0-s);
+        if (shOn > 0.5){ float a = shadowAt(vw.xy + vw.z*shk, vze); col = mix(col, col*shCol, a); }
+        gl_FragColor = vec4(col, c.a);
+      }`, ['sp','ze','t','n','w'], ['sz','tf','tb','ccw','L','shk','shCol','shOn','sm','smSz','smK','blur','eps']);
+    GLW.map=prog(`attribute float ze; attribute vec2 t; attribute vec3 w;
+      uniform vec2 smSz; uniform float smK; uniform vec2 shk; uniform vec2 base; varying vec2 vt; varying float vze;
+      void main(){ vt=t; vze=ze; vec2 q=(w.xy+w.z*shk+base)*smK; gl_Position=vec4(q.x/smSz.x*2.0-1.0, 1.0-q.y/smSz.y*2.0, -ze/4000.0, 1.0); }`,
+      GLSL_HEAD+`uniform sampler2D tf; uniform float alpha; varying vec2 vt; varying float vze;
+      void main(){ if (texture2D(tf,vt).a < 0.5) discard;
+        float v=clamp(vze/4000.0,0.0,0.9999); gl_FragColor=vec4(floor(v*255.0)/255.0, fract(v*255.0), alpha, 1.0); }`,
+      ['ze','t','w'], ['smSz','smK','shk','base','tf','alpha']);
+    GLW.ground=prog(`attribute vec2 q; void main(){ gl_Position=vec4(q,0.0,1.0); }`,
+      GLSL_HEAD+GLSL_SHADOW+`uniform vec2 sz; uniform float k; uniform vec3 shCol;
+      void main(){ vec2 d=vec2(gl_FragCoord.x, sz.y-gl_FragCoord.y)/k; float a=shadowAt(d, -1.0); gl_FragColor=vec4(shCol*a, a); }`,
+      ['q'], ['sz','k','shCol','sm','smSz','smK','blur','eps']);
+    GLW.vb=gl.createBuffer(); GLW.ib=gl.createBuffer(); GLW.qb=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,GLW.qb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+    GLW.smTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,GLW.smTex);
+    for (const [k,v] of [[gl.TEXTURE_MIN_FILTER,gl.NEAREST],[gl.TEXTURE_MAG_FILTER,gl.NEAREST],[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D,k,v);
+    GLW.smDepth=gl.createRenderbuffer(); GLW.fb=gl.createFramebuffer(); GLW.smW=0; GLW.smH=0;
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,true); gl.clearColor(0,0,0,0);
     GLW.max=Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 4096);
     c.addEventListener('webglcontextlost', e=>{ e.preventDefault(); for (const sim of WIND.sims.values()) if (sim.sprite) sim.sprite.gl=null; });
     GLW.gl=gl; GLW.cv=c; return gl;
@@ -920,55 +1014,92 @@ function glTex(gl, img){
   for (const [k,v] of [[gl.TEXTURE_MIN_FILTER,gl.LINEAR],[gl.TEXTURE_MAG_FILTER,gl.LINEAR],[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D,k,v);
   return t;
 }
-/* render as many upcoming strips as fit into the atlas, starting at list[from] */
-function glBatch(G, from){
-  const gl=GLW.gl, cw=G.ctx.canvas.width, ch=G.ctx.canvas.height, k=G.k;
-  if (GLW.cv.width!==cw || GLW.cv.height!==ch){ GLW.cv.width=cw; GLW.cv.height=ch; }
-  gl.viewport(0,0,cw,ch); gl.uniform2f(GLW.loc.sz,cw,ch);
-  gl.disable(gl.SCISSOR_TEST); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); gl.enable(gl.SCISSOR_TEST);
-  let x=0, y=0, shelf=0;
-  for (let i=from;i<G.list.length;i++){
-    const {s,im,sim}=G.list[i], pp=sim.pp;
-    let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
-    for (let j=0;j<sim.n;j++){ const px=pp[j*2]*k, py=pp[j*2+1]*k; if(px<x0)x0=px; if(px>x1)x1=px; if(py<y0)y0=py; if(py>y1)y1=py; }
-    x0=Math.max(0,Math.floor(x0)-1); y0=Math.max(0,Math.floor(y0)-1); x1=Math.min(cw,Math.ceil(x1)+1); y1=Math.min(ch,Math.ceil(y1)+1);
-    const w=x1-x0, h=y1-y0;
-    if (w<=0 || h<=0){ G.tiles.set(s.id,null); continue; }
-    if (x+w>cw){ x=0; y+=shelf+2; shelf=0; }
-    if (y+h>ch) return;                                   // atlas full: the rest go in the next batch
-    const sp=spriteFor(s, im, sim, Math.min(spriteRes(s,sim,k,G.exporting), GLW.max/Math.max(sim.uLen,sim.vLen)), !G.exporting);
-    if (!sp.gl) sp.gl=[glTex(gl,sp.front), glTex(gl,sp.back)];
-    const {n,p,a,b,nrm}=sim, v=new Float32Array(n*8), rs=sp.res, dx=x-x0, dy=y-y0;
-    for (let j=0;j<n;j++){ const o=j*8;
-      v[o]=pp[j*2]*k+dx; v[o+1]=pp[j*2+1]*k+dy; v[o+2]=p[j*3+2];
-      v[o+3]=a[j]*rs/sp.w; v[o+4]=b[j]*rs/sp.h; v[o+5]=nrm[j*3]; v[o+6]=nrm[j*3+1]; v[o+7]=nrm[j*3+2]; }
-    gl.bufferData(gl.ARRAY_BUFFER,v,gl.STREAM_DRAW); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,sim.idx,gl.STREAM_DRAW);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sp.gl[0]);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,sp.gl[1]);
-    /* GL calls a face front when it winds counter-clockwise as seen, so a face that winds clockwise on screen at rest is GL's back */
-    gl.uniform1f(GLW.loc.ccw, sim.faceCW?0:1);
-    gl.scissor(x, ch-y-h, w, h);                          // parts beyond the canvas must not spill into the next tile
-    gl.drawElements(gl.TRIANGLES, sim.idx.length, gl.UNSIGNED_SHORT, 0);
-    if (G.exporting) freeSprite(sp);                      // export sprites are one-off
-    G.tiles.set(s.id,{tx:x,ty:y,w,h,bx:x0,by:y0});
-    x+=w+2; shelf=Math.max(shelf,h);
-  }
-}
-function glPlan(ctx, k, order, exporting){
-  const gl=glInit(); if (!gl) return null;
+/* can this target be drawn through WebGL at all? */
+function glFits(ctx){
+  const gl=glInit(); if (!gl) return false;
   const cw=ctx.canvas.width, ch=ctx.canvas.height, vp=gl.getParameter(gl.MAX_VIEWPORT_DIMS), rb=gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
-  if (cw>Math.min(vp[0],rb) || ch>Math.min(vp[1],rb) || cw*ch>40e6) return null;    // very large exports take the 2D path
-  const list=[];
-  for (const s of order){ const sim=WIND.sims.get(s.id), im=imgById(s.img); if (sim && im) list.push({s,im,sim}); }
-  return { ctx, k, list, exporting, tiles:new Map(), pos:new Map(list.map((e,i)=>[e.s.id,i])) };
+  return !(cw>Math.min(vp[0],rb) || ch>Math.min(vp[1],rb) || cw*ch>40e6);   // very large exports take the 2D path
 }
-function glComposite(G, s){
-  if (!G.tiles.has(s.id)) glBatch(G, G.pos.get(s.id));
-  const t=G.tiles.get(s.id); if (!t) return true;
-  if (GLW.gl.isContextLost()) return false;
-  G.ctx.drawImage(GLW.cv, t.tx,t.ty,t.w,t.h, t.bx/G.k,t.by/G.k,t.w/G.k,t.h/G.k);
+const attrib=(gl,loc,size,off)=>{ if (loc<0) return; gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,size,gl.FLOAT,false,44,off); };
+function glRun(ctx, k, run, exporting){
+  const gl=GLW.gl, cw=ctx.canvas.width, ch=ctx.canvas.height;
+  if (GLW.cv.width!==cw || GLW.cv.height!==ch){ GLW.cv.width=cw; GLW.cv.height=ch; }
+  /* one vertex buffer for the whole run */
+  let nv=0, ni=0; for (const e of run){ nv+=e.sim.n; ni+=e.sim.idx.length; }
+  const V=new Float32Array(nv*11), I=new Uint32Array(ni), draws=[]; let vo=0, io=0;
+  const idx32 = nv>65535 ? gl.getExtension('OES_element_index_uint') : null;
+  if (nv>65535 && !idx32) return false;
+  for (const {s,im,sim} of run){
+    const sp=spriteFor(s, im, sim, Math.min(spriteRes(s,sim,k,exporting), GLW.max/Math.max(sim.uLen,sim.vLen)), !exporting);
+    if (!sp.gl) sp.gl=[glTex(gl,sp.front), glTex(gl,sp.back)];
+    const {n,p,pp,a,b,nrm}=sim, rs=sp.res, z0=sim.rank*GAP;
+    for (let j=0;j<n;j++){ const o=(vo+j)*11;
+      V[o]=pp[j*2]*k; V[o+1]=pp[j*2+1]*k; V[o+2]=p[j*3+2]+z0; V[o+3]=a[j]*rs/sp.w; V[o+4]=b[j]*rs/sp.h;
+      V[o+5]=nrm[j*3]; V[o+6]=nrm[j*3+1]; V[o+7]=nrm[j*3+2]; V[o+8]=p[j*3]; V[o+9]=p[j*3+1]; V[o+10]=p[j*3+2]; }
+    for (let j=0;j<sim.idx.length;j++) I[io+j]=sim.idx[j]+vo;
+    draws.push({sp,im,sim,off:io,count:sim.idx.length}); vo+=n; io+=sim.idx.length;
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER,GLW.vb); gl.bufferData(gl.ARRAY_BUFFER,V,gl.STREAM_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,GLW.ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx32?I:new Uint16Array(I), gl.STREAM_DRAW);
+  const itype=idx32?gl.UNSIGNED_INT:gl.UNSIGNED_SHORT, isz=idx32?4:2;
+  const shadowed=draws.some(d=>d.im.shOn && d.im.shAlpha>0), lead=(draws.find(d=>d.im.shOn)||draws[0]).im;
+  /* shadow map at half resolution */
+  const smK=k*0.5, smW=Math.max(1,Math.ceil(cw*0.5)), smH=Math.max(1,Math.ceil(ch*0.5));
+  const setShadowUniforms=(P)=>{ gl.uniform1i(P.sm,2); gl.uniform2f(P.smSz,smW,smH); gl.uniform1f(P.smK,smK);
+    gl.uniform1f(P.blur, Math.max(lead.shBlur,0)*0.6*1.6*smK); gl.uniform1f(P.eps, GAP*0.5); };
+  if (shadowed){
+    if (GLW.smW!==smW || GLW.smH!==smH){
+      gl.bindTexture(gl.TEXTURE_2D,GLW.smTex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,smW,smH,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+      gl.bindRenderbuffer(gl.RENDERBUFFER,GLW.smDepth); gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,smW,smH);
+      gl.bindFramebuffer(gl.FRAMEBUFFER,GLW.fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,GLW.smTex,0);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,GLW.smDepth);
+      GLW.smW=smW; GLW.smH=smH;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER,GLW.fb); gl.viewport(0,0,smW,smH);
+    gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    const P=GLW.map; gl.useProgram(P.pr);
+    for (let i=0;i<8;i++) gl.disableVertexAttribArray(i);
+    attrib(gl,P.ze,1,8); attrib(gl,P.t,2,12); attrib(gl,P.w,3,32);
+    gl.uniform2f(P.smSz,smW,smH); gl.uniform1f(P.smK,smK); gl.uniform2f(P.shk,...SHK); gl.uniform1i(P.tf,0);
+    for (const d of draws){
+      gl.uniform2f(P.base, d.im.shDist*0.7, d.im.shDist); gl.uniform1f(P.alpha, d.im.shOn ? d.im.shAlpha/100 : 0);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,d.sp.gl[0]);
+      gl.drawElements(gl.TRIANGLES,d.count,itype,d.off*isz);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    /* ground layer: shadows on what lies under the run, blended into the canvas like the flat shadows */
+    gl.viewport(0,0,cw,ch); gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.clear(gl.COLOR_BUFFER_BIT);
+    const G=GLW.ground; gl.useProgram(G.pr);
+    for (let i=0;i<8;i++) gl.disableVertexAttribArray(i);
+    gl.bindBuffer(gl.ARRAY_BUFFER,GLW.qb); gl.enableVertexAttribArray(G.q); gl.vertexAttribPointer(G.q,2,gl.FLOAT,false,0,0);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,GLW.smTex);
+    setShadowUniforms(G); gl.uniform2f(G.sz,cw,ch); gl.uniform1f(G.k,k); gl.uniform3f(G.shCol,...hexRGB(lead.shColor));
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalCompositeOperation=lead.shBlend; ctx.drawImage(GLW.cv,0,0); ctx.restore();
+    gl.bindBuffer(gl.ARRAY_BUFFER,GLW.vb);
+  }
+  /* the strips themselves */
+  gl.viewport(0,0,cw,ch); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  const P=GLW.strip; gl.useProgram(P.pr);
+  for (let i=0;i<8;i++) gl.disableVertexAttribArray(i);
+  attrib(gl,P.sp,2,0); attrib(gl,P.ze,1,8); attrib(gl,P.t,2,12); attrib(gl,P.n,3,20); attrib(gl,P.w,3,32);
+  gl.uniform2f(P.sz,cw,ch); gl.uniform1i(P.tf,0); gl.uniform1i(P.tb,1); gl.uniform3f(P.L,...LIGHT); gl.uniform2f(P.shk,...SHK);
+  setShadowUniforms(P); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,GLW.smTex);
+  for (const d of draws){   // layer order, so the soft edges of lower strips are blended first
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,d.sp.gl[0]);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,d.sp.gl[1]);
+    /* GL calls a face front when it winds counter-clockwise as seen, so a face that winds clockwise on screen at rest is GL's back */
+    gl.uniform1f(P.ccw, d.sim.faceCW?0:1);
+    gl.uniform1f(P.shOn, shadowed?1:0); gl.uniform3f(P.shCol,...hexRGB(d.im.shColor));
+    gl.drawElements(gl.TRIANGLES,d.count,itype,d.off*isz);
+  }
+  ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.drawImage(GLW.cv,0,0); ctx.restore();
+  if (exporting) for (const d of draws) freeSprite(d.sp);   // export sprites are one-off
   return true;
 }
+function hexRGB(h){ const v=parseInt((h||'#000').slice(1),16); return [(v>>16&255)/255,(v>>8&255)/255,(v&255)/255]; }
 /* pins and wind direction, drawn on the overlay while the Wind panel is under the pointer */
 function drawWindGuides(ink, paper){
   const scope = windOn() ? WIND.scope : (S.wind.selOnly && SEL.size ? SEL : null);
