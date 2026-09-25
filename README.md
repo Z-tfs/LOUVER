@@ -59,6 +59,12 @@ A multiple selection moves, rotates and scales as a block, keeping the strips' r
 
 Paper grain or one of two fibre textures, light and dark, laid over the photo in a blend mode of your choice rather than replacing its colour. Shadows have their own colour, blend mode, opacity, offset and blur. The canvas sits on a paper-coloured background you can set or switch off. Like Arrange, these belong to the selected source and can be copied to all.
 
+## Wind
+
+Blow on the composition and watch the strips lift off the page. Choose where every strip is **pinned** — its start (the left end of a horizontal strip, the top of a vertical one), middle, end, both ends, or along one long edge like a louver blade — then set the wind's **direction**, **strength**, **gusts** and how stiff the paper is. Hover over the Wind panel to see the pins and a wind arrow on the canvas.
+
+The strips are treated as thin sheets in 3D: they bend, twist and turn over, and wherever one turns over you see the back of the paper (its colour is yours to set). They are shaded by how they face the light, grow slightly as they rise toward you, and cast shadows that drift and soften with height. **Selected strips only** blows just the current selection. **Freeze** holds a moment; exporting while the wind blows or is frozen captures exactly that moment. **Stop** lets the strips settle back flat into the composition you left, and canvas editing resumes.
+
 ## Export
 
 PNG or JPG, at any width up to 12000px, with the DPI written into the file so 300 dpi print sizes land correctly — the panel shows the physical size in inches as you change it. PNG can keep a transparent background. Black and white is a separate switch here, so you can work in colour and export in grey, or the reverse. The export is re-rendered from the original files at full resolution; it is never a scaled-up screenshot of the preview.

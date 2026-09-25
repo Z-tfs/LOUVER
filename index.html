@@ -150,6 +150,7 @@ input[type=color]::-webkit-color-swatch{border:0}
 .toast{position:fixed;left:50%;bottom:46px;transform:translateX(-50%);background:var(--ink);color:var(--bg);font-family:var(--mono);font-size:10.5px;letter-spacing:.05em;padding:8px 14px;opacity:0;pointer-events:none;transition:opacity .15s;z-index:9}
 .toast.on{opacity:1}
 
+.warrow{display:inline-block;font-style:normal;transform-origin:50% 55%}
 .kbd{font-family:var(--mono);border:1px solid var(--rule);padding:0 4px;font-size:9px;color:var(--mute)}
 
 @media (max-width:900px){ .app{grid-template-columns:280px 1fr} .mast .title span{display:none} .mast .status b:nth-child(3){display:none} }
@@ -256,6 +257,26 @@ input[type=color]::-webkit-color-swatch{border:0}
     </div>
   </section>
 
+  <section class="sec" id="windSec">
+    <h2>Wind <em id="windInfo">still</em></h2>
+    <div class="body">
+      <div class="row"><span class="lb">Pinned at</span></div>
+      <div class="seg" id="pinSeg"><button data-p="start" aria-pressed="true">Start</button><button data-p="middle">Middle</button><button data-p="end">End</button><button data-p="both">Both ends</button><button data-p="edge">Long edge</button></div>
+      <p class="note">Start is the left end of a horizontal strip, the top of a vertical one. Pins and the wind arrow show on the canvas while the pointer is over this panel.</p>
+      <div class="row grp"><label for="wDir">Direction</label><span class="val"><i id="wArrow" class="warrow">→</i> <span id="wDirV">0</span>°</span></div>
+      <input type="range" id="wDir" min="0" max="359" value="0">
+      <div class="row"><label for="wStr">Strength</label><span class="val" id="wStrV">50</span></div>
+      <input type="range" id="wStr" min="0" max="100" value="50">
+      <div class="row"><label for="wGust">Gusts</label><span class="val" id="wGustV">40</span></div>
+      <input type="range" id="wGust" min="0" max="100" value="40">
+      <div class="row"><label for="wStiff">Paper stiffness</label><span class="val" id="wStiffV">40</span></div>
+      <input type="range" id="wStiff" min="0" max="100" value="40">
+      <div class="row grp"><label for="wBack">Paper back</label><span><input type="color" id="wBack" value="#f4f1ea"></span></div>
+      <div class="row"><label class="toggle"><input type="checkbox" id="wSel">Selected strips only</label></div>
+      <div class="btns grp"><button class="btn solid" id="btnWind">Blow</button><button class="btn" id="btnFreeze" disabled>Freeze</button></div>
+      <p class="note">Export while the wind blows, or after Freeze, captures that moment.</p>
+    </div>
+  </section>
   <section class="sec">
     <h2>Selection <em id="selInfo">none</em></h2>
     <div class="body" id="selBody">
@@ -337,7 +358,9 @@ const S = {
   strips:[],          // {id,img,band,N,poly,cx,cy,v,rx,ry,rr,mx,my,rot,sx,sy,z}
   bgOn:true, bg:'#efece6',
   fmt:'png', expW:3000, dpi:300, expBW:false, expTrans:false,
+  wind:{pin:'start', dir:0, strength:50, gust:40, stiff:40, back:'#f4f1ea', selOnly:false},
 };
+const WDEF = {...S.wind};
 const BM = {};              // id -> HTMLImageElement (original resolution)
 /* per-source parameters (arrangement + surface); every image carries its own copy */
 const DEF = { arrange:'none', overlap:50, gap:0, autoMode:'alternate', gScale:100, gX:0, gY:0,
@@ -562,9 +585,17 @@ function render(ctx, k, opts={}){
     return;
   }
   const order = S.strips.slice().sort((a,b)=>a.z-b.z);
+  if (WIND.sims.size){      /* a lifted strip rises above the stack: each layer counts as a thin sheet */
+    const key={}; order.forEach((s,i)=>{ const sim=WIND.sims.get(s.id); key[s.id]=i*0.05+(sim?sim.avgZ:0); });
+    order.sort((a,b)=>key[a.id]-key[b.id]);
+  }
   const pats = {};
+  for (const sim of WIND.sims.values()) projectSim(sim);
+  const G = WIND.sims.size ? glPlan(ctx, k, order, opts.export) : null;
   for (const s of order){
     const im = imgById(s.img); if(!im) continue; ensureParams(im);
+    const sim = WIND.sims.get(s.id);
+    if (sim){ windShadow(ctx, k, im, sim); if (!(G && glComposite(G, s))) drawWindStrip(ctx, k, s, im, sim, opts); continue; }
     const M = stripMatrix(s), p = pathOf(s);
     if (im.shOn && im.shAlpha>0){
       ctx.save(); ctx.translate(im.shDist*0.7, im.shDist); ctx.transform(M.a,M.b,M.c,M.d,M.e,M.f);
@@ -581,6 +612,392 @@ function render(ctx, k, opts={}){
   }
 }
 /* note on blur: canvas filter lengths are in device px in most engines, so scale by k */
+
+/* ---------------- wind ---------------- */
+/* A blowing strip becomes a small cloth: a grid of particles laid over the strip in its own
+   frame (u along the strip, v across it), integrated with Verlet and held together by distance
+   constraints. It is drawn as textured triangles cut from a pre-rendered sprite of the flat
+   strip; wherever a triangle has turned over, the paper back is drawn instead. No thickness. */
+const WIND = { mode:'off', sims:new Map(), t:0, ramp:0, acc:0, last:0, raf:0, scope:null, hover:false, rows:3, cmax:24 };
+const W_DT = 1/60;
+const LIGHT = (()=>{ const l=[-0.35,-0.55,1], n=Math.hypot(...l); return l.map(v=>v/n); })();
+const windOn = () => WIND.mode!=='off';
+function camD(){ return Math.max(S.W,S.H)*2.6; }
+function simKey(s){ polyOf(s); const p=imgById(s.img)||DEF; return `${s._c.key}|${s.sx.toFixed(3)}|${s.sy.toFixed(3)}|${(s.rot+s.rr).toFixed(2)}|${p.gScale}`; }
+function buildSim(s){
+  const poly=polyOf(s), g=s.g; if (poly.length<3) return null;
+  let u0=1e9,u1=-1e9,v0=1e9,v1=-1e9;
+  for (const [x,y] of poly){ const u=x*g.ux+y*g.uy, v=x*g.vx+y*g.vy; if(u<u0)u0=u; if(u>u1)u1=u; if(v<v0)v0=v; if(v>v1)v1=v; }
+  if (u1-u0<2 || v1-v0<1) return null;
+  const pad=Math.max(1,2.5/(K*DPR)); u0-=pad; u1+=pad; v0-=pad; v1+=pad;   // transparent margin, so edges are filtered, not cut
+  const uLen=u1-u0, vLen=v1-v0;
+  const R=WIND.rows, C=clamp(Math.round(uLen/Math.max(vLen/(R-1),6)), 2, WIND.cmax), C1=C+1, n=R*C1;
+  const sim={ key:simKey(s), u0,v0,uLen,vLen, R,C,n, a:new Float32Array(n), b:new Float32Array(n),
+    p:new Float32Array(n*3), q:new Float32Array(n*3), r:new Float32Array(n*3), nrm:new Float32Array(n*3), pp:new Float32Array(n*2),
+    pin:new Uint8Array(n), rw:new Float32Array(n), pinMode:null, ph:Math.random()*100, avgZ:0, sprite:null };
+  for (let i=0;i<R;i++) for (let j=0;j<C1;j++){ const k=i*C1+j; sim.a[k]=uLen*j/C; sim.b[k]=vLen*i/(R-1); }
+  restOf(sim,s); sim.p.set(sim.r); sim.q.set(sim.r);
+  /* which way round a triangle winds on screen while it still shows its face */
+  const r=sim.r, t0=0, t1=3, t2=(C1+1)*3;
+  sim.faceCW = ((r[t1]-r[t0])*(r[t2+1]-r[t0+1])-(r[t2]-r[t0])*(r[t1+1]-r[t0+1])) > 0;
+  const idx=[]; for (let i=0;i<R-1;i++) for (let j=0;j<C;j++){ const q0=i*C1+j; idx.push(q0,q0+1,q0+C1+1, q0,q0+C1+1,q0+C1); }
+  sim.idx=new Uint16Array(idx);
+  /* structural, shear and bending links; rest lengths from the flat pose */
+  const L=[], add=(x,y,k)=>{ const a=x*3,b=y*3; L.push(x,y,Math.hypot(sim.r[b]-sim.r[a],sim.r[b+1]-sim.r[a+1]),k); };
+  for (let i=0;i<R;i++) for (let j=0;j<C1;j++){ const k=i*C1+j;
+    if (j<C) add(k,k+1,1); if (i<R-1) add(k,k+C1,1);
+    if (j<C && i<R-1){ add(k,k+C1+1,0.7); add(k+1,k+C1,0.7); }
+    if (j<C-1) add(k,k+2,-1); if (i<R-2) add(k,k+2*C1,-1); }
+  const m=L.length/4; sim.ci=new Int32Array(m*2); sim.cl=new Float32Array(m); sim.ck=new Float32Array(m);
+  for (let c=0;c<m;c++){ sim.ci[c*2]=L[c*4]; sim.ci[c*2+1]=L[c*4+1]; sim.cl[c]=L[c*4+2]; sim.ck[c]=L[c*4+3]; }
+  setPins(sim);
+  return sim;
+}
+/* pinned particles and how firmly each particle is held back toward the flat pose */
+function setPins(sim){
+  const {R,C,n}=sim, C1=C+1, mode=S.wind.pin; sim.pinMode=mode; sim.pin.fill(0);
+  const cols = mode==='start'?[0]: mode==='end'?[C]: mode==='middle'?[Math.round(C/2)]: mode==='both'?[0,C]: null;
+  for (let i=0;i<R;i++) for (let j=0;j<C1;j++){ const k=i*C1+j;
+    let d;
+    if (cols){ if (cols.includes(j)) sim.pin[k]=1; d=Math.min(...cols.map(c=>Math.abs(j-c)))/(mode==='both'||mode==='middle'?C/2:C); }
+    else { if (i===0) sim.pin[k]=1; d=i/(R-1); }
+    sim.rw[k]=0.3+1.4*(1-clamp(d,0,1))**2;
+  }
+  for (let k=0;k<n;k++) if (sim.pin[k]){ const k3=k*3; sim.p[k3]=sim.q[k3]=sim.r[k3]; sim.p[k3+1]=sim.q[k3+1]=sim.r[k3+1]; sim.p[k3+2]=sim.q[k3+2]=0; }
+}
+function restOf(sim,s){
+  const M=stripMatrix(s), g=s.g, r=sim.r;
+  for (let k=0;k<sim.n;k++){ const u=sim.u0+sim.a[k], v=sim.v0+sim.b[k];
+    const x=u*g.ux+v*g.vx, y=u*g.uy+v*g.vy;
+    r[k*3]=M.a*x+M.c*y+M.e; r[k*3+1]=M.b*x+M.d*y+M.f; r[k*3+2]=0; }
+}
+function normalsOf(sim){
+  const {R,C,p,nrm}=sim, C1=C+1;
+  for (let i=0;i<R;i++) for (let j=0;j<C1;j++){
+    const k=(i*C1+j)*3, jl=(i*C1+Math.max(0,j-1))*3, jr=(i*C1+Math.min(C,j+1))*3, iu=(Math.max(0,i-1)*C1+j)*3, id=(Math.min(R-1,i+1)*C1+j)*3;
+    const ax=p[jr]-p[jl], ay=p[jr+1]-p[jl+1], az=p[jr+2]-p[jl+2], bx=p[id]-p[iu], by=p[id+1]-p[iu+1], bz=p[id+2]-p[iu+2];
+    let nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx; const l=Math.hypot(nx,ny,nz)||1;
+    nrm[k]=nx/l; nrm[k+1]=ny/l; nrm[k+2]=nz/l;
+  }
+}
+/* smooth turbulence: a few travelling sine waves, phase-shifted per strip */
+function turb(x,y,t,ph,o){
+  o[0]=Math.sin(x*0.012+t*1.9+ph)+0.6*Math.sin(y*0.021-t*3.1+ph*1.7);
+  o[1]=Math.sin(y*0.014+t*1.5+ph*1.3)+0.6*Math.sin(x*0.018+t*3.7-ph);
+  o[2]=Math.sin((x+y)*0.010+t*2.6+ph*0.7)+0.7*Math.sin(x*0.031-y*0.017-t*4.3+ph*2.1);
+}
+const TB=[0,0,0];
+function stepSim(sim, s, amt){
+  const w=S.wind, {n,p,q,r,pin,nrm,rw}=sim, t=WIND.t, dt=W_DT, dt2=dt*dt;
+  if (sim.pinMode!==w.pin) setPins(sim);
+  restOf(sim,s);
+  const st=w.stiff/100, kR=1.2+st*st*28, bend=0.04+st*0.5;
+  const speed=amt*w.strength/100*1500, gust=w.gust/100;
+  const th=w.dir*Math.PI/180, wx=Math.cos(th), wy=Math.sin(th);
+  const swell=1+gust*0.8*Math.sin(t*0.83+sim.ph)*Math.sin(t*0.29+sim.ph*1.9);
+  const base=speed*Math.max(0.15,swell), tb=speed*gust*0.55;
+  normalsOf(sim);
+  for (let k=0;k<n;k++){
+    const k3=k*3;
+    if (pin[k]){ p[k3]=q[k3]=r[k3]; p[k3+1]=q[k3+1]=r[k3+1]; p[k3+2]=q[k3+2]=0; continue; }
+    const px=p[k3],py=p[k3+1],pz=p[k3+2], vx=(px-q[k3])/dt, vy=(py-q[k3+1])/dt, vz=(pz-q[k3+2])/dt;
+    turb(px,py,t,sim.ph,TB);
+    const rx=base*wx+tb*TB[0]-vx, ry=base*wy+tb*TB[1]-vy, rz=base*0.28+tb*TB[2]*1.2-vz;   // wind relative to the paper
+    const nx=nrm[k3],ny=nrm[k3+1],nz=nrm[k3+2], dn=2.6*(rx*nx+ry*ny+rz*nz), kk=kR*rw[k];
+    const ax=dn*nx+0.55*rx+kk*(r[k3]-px), ay=dn*ny+0.55*ry+kk*(r[k3+1]-py), az=dn*nz+0.55*rz-kk*pz;
+    q[k3]=px; q[k3+1]=py; q[k3+2]=pz;
+    p[k3]=px+vx*dt*0.985+ax*dt2; p[k3+1]=py+vy*dt*0.985+ay*dt2; p[k3+2]=pz+vz*dt*0.985+az*dt2;
+  }
+  const {ci,cl,ck}=sim, m=cl.length;
+  for (let it=0;it<6;it++) for (let c=0;c<m;c++){
+    const ia=ci[c*2], ib=ci[c*2+1], wa=pin[ia]?0:1, wb=pin[ib]?0:1; if(!(wa+wb)) continue;
+    const a=ia*3, b=ib*3, dx=p[b]-p[a], dy=p[b+1]-p[a+1], dz=p[b+2]-p[a+2], L=Math.hypot(dx,dy,dz); if (L<1e-6) continue;
+    const f=(L-cl[c])/L*(ck[c]<0?bend:ck[c])/(wa+wb);
+    p[a]+=dx*f*wa; p[a+1]+=dy*f*wa; p[a+2]+=dz*f*wa; p[b]-=dx*f*wb; p[b+1]-=dy*f*wb; p[b+2]-=dz*f*wb;
+  }
+  let dev=0, vel=0, zs=0;
+  for (let k=0;k<n;k++){ const k3=k*3;
+    if (p[k3+2]<0){ p[k3+2]=0; q[k3+2]=0; q[k3]+=(p[k3]-q[k3])*0.3; q[k3+1]+=(p[k3+1]-q[k3+1])*0.3; }   // the paper below stops it
+    dev=Math.max(dev, Math.abs(p[k3]-r[k3])+Math.abs(p[k3+1]-r[k3+1])+p[k3+2]);
+    vel=Math.max(vel, Math.abs(p[k3]-q[k3])+Math.abs(p[k3+1]-q[k3+1])+Math.abs(p[k3+2]-q[k3+2]));
+    zs+=p[k3+2]; }
+  sim.avgZ=zs/n; sim.dev=dev; sim.vel=vel;
+}
+function dropSim(id){ const sim=WIND.sims.get(id); if (!sim) return; freeSprite(sim.sprite); WIND.sims.delete(id); }
+function windStep(){
+  WIND.t+=W_DT;
+  const target = WIND.mode==='run' ? 1 : 0;
+  WIND.ramp = clamp(WIND.ramp + clamp(target-WIND.ramp, -W_DT/0.8, W_DT/1.2), 0, 1);
+  const live=new Set();
+  for (const s of S.strips){
+    const inScope = WIND.mode==='run' && (!WIND.scope || WIND.scope.has(s.id));
+    let sim=WIND.sims.get(s.id);
+    if (!sim && !inScope) continue;
+    if (!sim || sim.key!==simKey(s)){ dropSim(s.id); sim=buildSim(s); if(!sim) continue; WIND.sims.set(s.id,sim); }
+    const amt = inScope ? WIND.ramp : (WIND.mode==='settle' ? WIND.ramp : 0);
+    stepSim(sim, s, amt);
+    if (amt<0.001 && sim.dev<0.4 && sim.vel<0.06){ dropSim(s.id); continue; }   // back flat: normal drawing again
+    live.add(s.id);
+  }
+  for (const id of [...WIND.sims.keys()]) if (!live.has(id)) dropSim(id);
+  if (WIND.mode==='settle' && !WIND.sims.size){ WIND.mode='off'; refreshWindUI(); }
+}
+function windLoop(ts){
+  WIND.raf=0; if (WIND.mode!=='run' && WIND.mode!=='settle') return;
+  const dt = WIND.last ? Math.min(0.1,(ts-WIND.last)/1000) : W_DT; WIND.last=ts;
+  WIND.acc+=dt; let n=0;
+  while (WIND.acc>=W_DT && n<3){ windStep(); WIND.acc-=W_DT; n++; }
+  if (n===3) WIND.acc=0;
+  draw();
+  if (WIND.mode==='run' || WIND.mode==='settle') WIND.raf=requestAnimationFrame(windLoop);
+}
+function kickWind(){ if (!WIND.raf){ WIND.last=0; WIND.raf=requestAnimationFrame(windLoop); } }
+function startWind(){
+  if (!S.strips.length){ toast('No strips to blow'); return; }
+  if (WIND.mode==='pause'){ WIND.mode='run'; refreshWindUI(); kickWind(); return; }
+  const scope = S.wind.selOnly ? new Set(SEL) : null;
+  if (scope && !scope.size){ toast('Select strips first, or turn off Selected strips only'); return; }
+  if (frameMode){ frameMode=null; refreshSources(); }
+  const n = scope ? scope.size : S.strips.length;
+  WIND.rows = n>60 ? 2 : 3;
+  const budget = glInit() ? 16000 : 4400;                               // triangles per frame: WebGL, or the slower 2D fallback
+  WIND.cmax = clamp(Math.floor(budget/(n*2*(WIND.rows-1))), 3, 48);
+  WIND.scope=scope; WIND.mode='run'; refreshWindUI(); kickWind();
+}
+function stopWind(){ if (WIND.mode==='off') return; WIND.mode='settle'; refreshWindUI(); kickWind(); }
+function freezeWind(){
+  if (WIND.mode==='run'){ WIND.mode='pause'; if (WIND.raf){ cancelAnimationFrame(WIND.raf); WIND.raf=0; } refreshWindUI(); draw(); }
+  else if (WIND.mode==='pause'){ WIND.mode='run'; refreshWindUI(); kickWind(); }
+}
+function refreshWindUI(){
+  const m=WIND.mode;
+  $('btnWind').textContent = (m==='run'||m==='pause') ? 'Stop' : 'Blow';
+  $('btnFreeze').disabled = !(m==='run'||m==='pause');
+  $('btnFreeze').textContent = m==='pause' ? 'Resume' : 'Freeze';
+  $('windInfo').textContent = {off:'still',run:'blowing',pause:'frozen',settle:'settling'}[m];
+  refreshStatus(); draw();
+}
+
+/* sprites: the flat strip (front), its paper back, and a silhouette used for shading,
+   all in the strip's own u/v frame at `res` pixels per unit */
+function spriteFor(s, im, sim, res, keep){
+  const key=`${res.toFixed(3)}|${im.bw}|${im.texture}|${im.texBlend}|${im.texAlpha}|${S.wind.back}`;
+  if (keep && sim.sprite && sim.sprite.key===key) return sim.sprite;
+  if (keep) freeSprite(sim.sprite);
+  const w=Math.max(1,Math.ceil(sim.uLen*res)), h=Math.max(1,Math.ceil(sim.vLen*res)), g=s.g, path=pathOf(s);
+  const T=[res*g.ux, res*g.vx, res*g.uy, res*g.vy, -res*sim.u0, -res*sim.v0];
+  const b=bbox(polyOf(s));
+  const mk=(fn)=>{ const c=document.createElement('canvas'); c.width=w; c.height=h; const x=c.getContext('2d'); x.setTransform(...T); fn(x); return c; };
+  const tex=(x)=>{ if (im.texture==='none' || !(im.texAlpha>0)) return;
+    x.globalCompositeOperation=im.texBlend; x.globalAlpha=im.texAlpha/100; x.fillStyle=x.createPattern(TEX[im.texture],'repeat');
+    x.fillRect(b[0]-2,b[1]-2,b[2]-b[0]+4,b[3]-b[1]+4); };
+  const sp={ key, res, w, h,
+    front: mk(x=>{ x.clip(path); drawImageAt(x,im); tex(x); }),
+    back:  mk(x=>{ x.clip(path); x.fillStyle=S.wind.back; x.fillRect(b[0]-2,b[1]-2,b[2]-b[0]+4,b[3]-b[1]+4); tex(x); }),
+    mask:  mk(x=>{ x.fillStyle='#000'; x.fill(path); }) };
+  if (keep) sim.sprite=sp;
+  return sp;
+}
+function drawTri(ctx, sp, img, shade, u0,v0,u1,v1,u2,v2, x0,y0,x1,y1,x2,y2, grow){
+  const du1=u1-u0, dv1=v1-v0, du2=u2-u0, dv2=v2-v0, det=du1*dv2-du2*dv1; if (Math.abs(det)<1e-9) return;
+  const dx1=x1-x0, dy1=y1-y0, dx2=x2-x0, dy2=y2-y0;
+  const a=(dx1*dv2-dx2*dv1)/det, c=(dx2*du1-dx1*du2)/det, b=(dy1*dv2-dy2*dv1)/det, d=(dy2*du1-dy1*du2)/det;
+  /* grow the clip a fraction of a pixel so neighbouring triangles leave no hairline seams */
+  const cx=(x0+x1+x2)/3, cy=(y0+y1+y2)/3, gx=(x,y)=>{ const l=Math.hypot(x-cx,y-cy)||1; return [x+(x-cx)/l*grow, y+(y-cy)/l*grow]; };
+  const A=gx(x0,y0), B=gx(x1,y1), C=gx(x2,y2);
+  const sx=Math.max(0,Math.floor(Math.min(u0,u1,u2))-2), sy=Math.max(0,Math.floor(Math.min(v0,v1,v2))-2);
+  const sw=Math.min(sp.w,Math.ceil(Math.max(u0,u1,u2))+2)-sx, sh=Math.min(sp.h,Math.ceil(Math.max(v0,v1,v2))+2)-sy;
+  if (sw<=0 || sh<=0) return;
+  ctx.save();
+  ctx.beginPath(); ctx.moveTo(A[0],A[1]); ctx.lineTo(B[0],B[1]); ctx.lineTo(C[0],C[1]); ctx.closePath(); ctx.clip();
+  ctx.transform(a,b,c,d, x0-a*u0-c*v0, y0-b*u0-d*v0);
+  ctx.drawImage(img, sx,sy,sw,sh, sx,sy,sw,sh);
+  if (shade>0.015){ ctx.globalAlpha=shade; ctx.drawImage(sp.mask, sx,sy,sw,sh, sx,sy,sw,sh); }
+  ctx.restore();
+}
+function spriteRes(s, sim, k, exact){
+  const M=stripMatrix(s), g=s.g;
+  const scl=Math.max(Math.hypot(M.a*g.ux+M.c*g.uy, M.b*g.ux+M.d*g.uy), Math.hypot(M.a*g.vx+M.c*g.vy, M.b*g.vx+M.d*g.vy));
+  const cap=Math.min(4096/sim.uLen, 4096/sim.vLen, Math.sqrt(16e6/(sim.uLen*sim.vLen)));
+  const res=Math.min(k*scl, cap);
+  return exact ? res : Math.min(cap, Math.pow(2,Math.round(Math.log2(res)*8)/8));   // quantised so small zoom changes reuse the sprite
+}
+function projectSim(sim){
+  const {p,pp}=sim, D=camD(), W2=S.W/2, H2=S.H/2;
+  for (let i=0;i<sim.n;i++){ const f=D/(D-Math.min(p[i*3+2],D*0.7)); pp[i*2]=W2+(p[i*3]-W2)*f; pp[i*2+1]=H2+(p[i*3+1]-H2)*f; }
+}
+/* shadow on the ground under each cell: further out and softer where the paper is higher */
+function windShadow(ctx, k, im, sim){
+  if (!im.shOn || !(im.shAlpha>0)) return;
+  const {R,C,p}=sim, C1=C+1, ox=im.shDist*0.7, oy=im.shDist, sh=new Path2D();
+  const gp=i=>[p[i*3]+ox+p[i*3+2]*0.45, p[i*3+1]+oy+p[i*3+2]*0.6];
+  for (let i=0;i<R-1;i++) for (let j=0;j<C;j++){ const q=[i*C1+j, i*C1+j+1, (i+1)*C1+j+1, (i+1)*C1+j].map(gp);
+    let ar=0; for (let t=0;t<4;t++){ const u=q[t], v=q[(t+1)%4]; ar+=u[0]*v[1]-v[0]*u[1]; } if (ar<0) q.reverse();
+    sh.moveTo(q[0][0],q[0][1]); for (let t=1;t<4;t++) sh.lineTo(q[t][0],q[t][1]); sh.closePath(); }
+  ctx.save(); ctx.globalCompositeOperation=im.shBlend; ctx.globalAlpha=im.shAlpha/100/(1+sim.avgZ/250);
+  const bl=im.shBlur*(1+sim.avgZ/60); if (bl>0) ctx.filter=`blur(${bl*k*0.6}px)`;
+  ctx.fillStyle=im.shColor; ctx.fill(sh); ctx.restore();
+}
+/* Canvas 2D path: one clipped, affine-mapped drawImage per triangle. Used for export (any
+   size, one frame) and when WebGL is unavailable; the live preview goes through WebGL. */
+function drawWindStrip(ctx, k, s, im, sim, opts){
+  const sp=spriteFor(s, im, sim, spriteRes(s,sim,k,opts.export), !opts.export);
+  const {R,C,p,pp,a,b}=sim, C1=C+1;
+  /* painter's order inside the strip, so a curl draws over what it curls over */
+  const cells=[];
+  for (let i=0;i<R-1;i++) for (let j=0;j<C;j++){ const q0=i*C1+j; cells.push([q0, p[q0*3+2]+p[(q0+1)*3+2]+p[(q0+C1)*3+2]+p[(q0+C1+1)*3+2]]); }
+  cells.sort((x,y)=>x[1]-y[1]);
+  const grow=0.7/k, rs=sp.res;
+  const tri=(i0,i1,i2)=>{
+    const u0=a[i0]*rs,v0=b[i0]*rs,u1=a[i1]*rs,v1=b[i1]*rs,u2=a[i2]*rs,v2=b[i2]*rs;
+    const x0=pp[i0*2],y0=pp[i0*2+1],x1=pp[i1*2],y1=pp[i1*2+1],x2=pp[i2*2],y2=pp[i2*2+1];
+    const front=(((x1-x0)*(y2-y0)-(x2-x0)*(y1-y0)) > 0) === sim.faceCW;
+    const e1=[p[i1*3]-p[i0*3],p[i1*3+1]-p[i0*3+1],p[i1*3+2]-p[i0*3+2]], e2=[p[i2*3]-p[i0*3],p[i2*3+1]-p[i0*3+1],p[i2*3+2]-p[i0*3+2]];
+    let nx=e1[1]*e2[2]-e1[2]*e2[1], ny=e1[2]*e2[0]-e1[0]*e2[2], nz=e1[0]*e2[1]-e1[1]*e2[0]; const l=Math.hypot(nx,ny,nz)||1;
+    if (nz<0){ nx=-nx; ny=-ny; nz=-nz; }
+    const shade=clamp((LIGHT[2]-(nx*LIGHT[0]+ny*LIGHT[1]+nz*LIGHT[2])/l)*1.3,0,0.62)+(front?0:0.05);
+    drawTri(ctx, sp, front?sp.front:sp.back, shade, u0,v0,u1,v1,u2,v2, x0,y0,x1,y1,x2,y2, grow);
+  };
+  for (const [q0] of cells){ tri(q0,q0+1,q0+C1+1); tri(q0,q0+C1+1,q0+C1); }
+}
+
+/* WebGL path for the live preview. Blowing strips are rendered into separate tiles of one
+   offscreen WebGL canvas (depth-tested, smooth-shaded, front or back texture by facing),
+   then each tile is composited into the 2D canvas at its place in the layer order. */
+const GLW = { gl:null, cv:null, failed:false };
+function glInit(){
+  if (GLW.gl && !GLW.gl.isContextLost()) return GLW.gl;
+  if (GLW.failed) return null;
+  try{
+    const c=document.createElement('canvas');
+    const gl=c.getContext('webgl',{premultipliedAlpha:true, preserveDrawingBuffer:true, antialias:false, depth:true, alpha:true});
+    if (!gl) throw new Error('no webgl');
+    const sh=(type,src)=>{ const o=gl.createShader(type); gl.shaderSource(o,src); gl.compileShader(o); if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+    const pr=gl.createProgram();
+    gl.attachShader(pr, sh(gl.VERTEX_SHADER, `attribute vec3 p; attribute vec2 t; attribute vec3 n; uniform vec2 sz; varying vec2 vt; varying vec3 vn;
+      void main(){ vt=t; vn=n; gl_Position=vec4(p.x/sz.x*2.0-1.0, 1.0-p.y/sz.y*2.0, -p.z/4000.0, 1.0); }`));
+    gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, `#ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+      #else
+      precision mediump float;
+      #endif
+      uniform sampler2D tf; uniform sampler2D tb; uniform float ccw; uniform vec3 L; varying vec2 vt; varying vec3 vn;
+      void main(){
+        bool front = gl_FrontFacing == (ccw > 0.5);
+        vec4 c = front ? texture2D(tf,vt) : texture2D(tb,vt);
+        if (c.a < 0.004) discard;
+        vec3 n = normalize(vn); if (n.z < 0.0) n = -n;
+        float s = clamp((L.z-dot(n,L))*1.3, 0.0, 0.62) + (front ? 0.0 : 0.05);
+        gl_FragColor = vec4(c.rgb*(1.0-s), c.a);
+      }`));
+    gl.linkProgram(pr); if (!gl.getProgramParameter(pr,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+    gl.useProgram(pr);
+    const L={}; for (const a of ['p','t','n']) L[a]=gl.getAttribLocation(pr,a); for (const u of ['sz','tf','tb','ccw','L']) L[u]=gl.getUniformLocation(pr,u);
+    GLW.vb=gl.createBuffer(); GLW.ib=gl.createBuffer(); GLW.loc=L;
+    gl.bindBuffer(gl.ARRAY_BUFFER,GLW.vb); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,GLW.ib);
+    gl.enableVertexAttribArray(L.p); gl.vertexAttribPointer(L.p,3,gl.FLOAT,false,32,0);
+    gl.enableVertexAttribArray(L.t); gl.vertexAttribPointer(L.t,2,gl.FLOAT,false,32,12);
+    gl.enableVertexAttribArray(L.n); gl.vertexAttribPointer(L.n,3,gl.FLOAT,false,32,20);
+    gl.uniform1i(L.tf,0); gl.uniform1i(L.tb,1); gl.uniform3f(L.L,...LIGHT);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,true);
+    gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA); gl.clearColor(0,0,0,0);
+    GLW.max=Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 4096);
+    c.addEventListener('webglcontextlost', e=>{ e.preventDefault(); for (const sim of WIND.sims.values()) if (sim.sprite) sim.sprite.gl=null; });
+    GLW.gl=gl; GLW.cv=c; return gl;
+  }catch(err){ console.warn('LOUVER: WebGL unavailable, wind falls back to canvas 2D', err); GLW.failed=true; return null; }
+}
+function freeSprite(sp){ if (sp && sp.gl && GLW.gl){ GLW.gl.deleteTexture(sp.gl[0]); GLW.gl.deleteTexture(sp.gl[1]); } if (sp) sp.gl=null; }
+function glTex(gl, img){
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+  for (const [k,v] of [[gl.TEXTURE_MIN_FILTER,gl.LINEAR],[gl.TEXTURE_MAG_FILTER,gl.LINEAR],[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D,k,v);
+  return t;
+}
+/* render as many upcoming strips as fit into the atlas, starting at list[from] */
+function glBatch(G, from){
+  const gl=GLW.gl, cw=G.ctx.canvas.width, ch=G.ctx.canvas.height, k=G.k;
+  if (GLW.cv.width!==cw || GLW.cv.height!==ch){ GLW.cv.width=cw; GLW.cv.height=ch; }
+  gl.viewport(0,0,cw,ch); gl.uniform2f(GLW.loc.sz,cw,ch);
+  gl.disable(gl.SCISSOR_TEST); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); gl.enable(gl.SCISSOR_TEST);
+  let x=0, y=0, shelf=0;
+  for (let i=from;i<G.list.length;i++){
+    const {s,im,sim}=G.list[i], pp=sim.pp;
+    let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+    for (let j=0;j<sim.n;j++){ const px=pp[j*2]*k, py=pp[j*2+1]*k; if(px<x0)x0=px; if(px>x1)x1=px; if(py<y0)y0=py; if(py>y1)y1=py; }
+    x0=Math.max(0,Math.floor(x0)-1); y0=Math.max(0,Math.floor(y0)-1); x1=Math.min(cw,Math.ceil(x1)+1); y1=Math.min(ch,Math.ceil(y1)+1);
+    const w=x1-x0, h=y1-y0;
+    if (w<=0 || h<=0){ G.tiles.set(s.id,null); continue; }
+    if (x+w>cw){ x=0; y+=shelf+2; shelf=0; }
+    if (y+h>ch) return;                                   // atlas full: the rest go in the next batch
+    const sp=spriteFor(s, im, sim, Math.min(spriteRes(s,sim,k,G.exporting), GLW.max/Math.max(sim.uLen,sim.vLen)), !G.exporting);
+    if (!sp.gl) sp.gl=[glTex(gl,sp.front), glTex(gl,sp.back)];
+    const {n,p,a,b,nrm}=sim, v=new Float32Array(n*8), rs=sp.res, dx=x-x0, dy=y-y0;
+    for (let j=0;j<n;j++){ const o=j*8;
+      v[o]=pp[j*2]*k+dx; v[o+1]=pp[j*2+1]*k+dy; v[o+2]=p[j*3+2];
+      v[o+3]=a[j]*rs/sp.w; v[o+4]=b[j]*rs/sp.h; v[o+5]=nrm[j*3]; v[o+6]=nrm[j*3+1]; v[o+7]=nrm[j*3+2]; }
+    gl.bufferData(gl.ARRAY_BUFFER,v,gl.STREAM_DRAW); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,sim.idx,gl.STREAM_DRAW);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sp.gl[0]);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,sp.gl[1]);
+    /* GL calls a face front when it winds counter-clockwise as seen, so a face that winds clockwise on screen at rest is GL's back */
+    gl.uniform1f(GLW.loc.ccw, sim.faceCW?0:1);
+    gl.scissor(x, ch-y-h, w, h);                          // parts beyond the canvas must not spill into the next tile
+    gl.drawElements(gl.TRIANGLES, sim.idx.length, gl.UNSIGNED_SHORT, 0);
+    if (G.exporting) freeSprite(sp);                      // export sprites are one-off
+    G.tiles.set(s.id,{tx:x,ty:y,w,h,bx:x0,by:y0});
+    x+=w+2; shelf=Math.max(shelf,h);
+  }
+}
+function glPlan(ctx, k, order, exporting){
+  const gl=glInit(); if (!gl) return null;
+  const cw=ctx.canvas.width, ch=ctx.canvas.height, vp=gl.getParameter(gl.MAX_VIEWPORT_DIMS), rb=gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+  if (cw>Math.min(vp[0],rb) || ch>Math.min(vp[1],rb) || cw*ch>40e6) return null;    // very large exports take the 2D path
+  const list=[];
+  for (const s of order){ const sim=WIND.sims.get(s.id), im=imgById(s.img); if (sim && im) list.push({s,im,sim}); }
+  return { ctx, k, list, exporting, tiles:new Map(), pos:new Map(list.map((e,i)=>[e.s.id,i])) };
+}
+function glComposite(G, s){
+  if (!G.tiles.has(s.id)) glBatch(G, G.pos.get(s.id));
+  const t=G.tiles.get(s.id); if (!t) return true;
+  if (GLW.gl.isContextLost()) return false;
+  G.ctx.drawImage(GLW.cv, t.tx,t.ty,t.w,t.h, t.bx/G.k,t.by/G.k,t.w/G.k,t.h/G.k);
+  return true;
+}
+/* pins and wind direction, drawn on the overlay while the Wind panel is under the pointer */
+function drawWindGuides(ink, paper){
+  const scope = windOn() ? WIND.scope : (S.wind.selOnly && SEL.size ? SEL : null);
+  ox.save(); ox.translate(OFX,OFY); ox.scale(K,K); ox.beginPath(); ox.rect(0,0,S.W,S.H); ox.clip();
+  const lw=1/K, mode=S.wind.pin;
+  for (const s of S.strips){
+    if (scope && !scope.has(s.id)) continue;
+    const sim=WIND.sims.get(s.id); let segs=[];
+    if (sim){ const {R,C,pp}=sim, C1=C+1;
+      if (mode==='edge') segs.push([...Array(C1).keys()].map(j=>[pp[j*2],pp[j*2+1]]));
+      else for (let j=0;j<C1;j++) if (sim.pin[j]) segs.push([...Array(R).keys()].map(i=>[pp[(i*C1+j)*2],pp[(i*C1+j)*2+1]]));
+    } else {
+      const poly=polyOf(s), g=s.g, M=stripMatrix(s); let u0=1e9,u1=-1e9,v0=1e9,v1=-1e9;
+      for (const [x,y] of poly){ const u=x*g.ux+y*g.uy, v=x*g.vx+y*g.vy; u0=Math.min(u0,u);u1=Math.max(u1,u);v0=Math.min(v0,v);v1=Math.max(v1,v); }
+      const P=(u,v)=>{ const q=M.transformPoint(new DOMPoint(u*g.ux+v*g.vx, u*g.uy+v*g.vy)); return [q.x,q.y]; };
+      const us = mode==='start'?[u0]: mode==='end'?[u1]: mode==='middle'?[(u0+u1)/2]: mode==='both'?[u0,u1]: null;
+      if (us) for (const u of us) segs.push([P(u,v0),P(u,v1)]); else segs.push([P(u0,v0),P(u1,v0)]);
+    }
+    for (const sg of segs){
+      ox.beginPath(); sg.forEach((q,i)=>i?ox.lineTo(q[0],q[1]):ox.moveTo(q[0],q[1]));
+      ox.strokeStyle=paper; ox.lineWidth=4*lw; ox.stroke(); ox.strokeStyle=ink; ox.lineWidth=2*lw; ox.stroke();
+      const m=sg[Math.floor(sg.length/2)], mm = sg.length%2 ? m : [(m[0]+sg[sg.length/2-1][0])/2,(m[1]+sg[sg.length/2-1][1])/2];
+      ox.fillStyle=ink; ox.beginPath(); ox.arc(mm[0],mm[1],3.2*lw,0,Math.PI*2); ox.fill();
+      ox.strokeStyle=paper; ox.lineWidth=1.2*lw; ox.stroke();
+    }
+  }
+  ox.restore();
+  /* compass in the canvas's top-right corner: arrow length follows strength */
+  const c=toStage({x:S.W,y:0}), cx0=c.x-34, cy0=c.y+34, th=S.wind.dir*Math.PI/180, L=8+18*S.wind.strength/100;
+  ox.fillStyle=paper; ox.strokeStyle=ink; ox.lineWidth=1;
+  ox.beginPath(); ox.arc(cx0,cy0,26,0,Math.PI*2); ox.fill(); ox.stroke();
+  const ex=cx0+Math.cos(th)*L, ey=cy0+Math.sin(th)*L, bx=cx0-Math.cos(th)*L, by=cy0-Math.sin(th)*L;
+  ox.lineWidth=1.6; ox.beginPath(); ox.moveTo(bx,by); ox.lineTo(ex,ey); ox.stroke();
+  ox.fillStyle=ink; ox.beginPath(); ox.moveTo(ex,ey);
+  ox.lineTo(ex-Math.cos(th-0.45)*7, ey-Math.sin(th-0.45)*7); ox.lineTo(ex-Math.cos(th+0.45)*7, ey-Math.sin(th+0.45)*7); ox.closePath(); ox.fill();
+}
 
 /* ---------------- preview ---------------- */
 const cv = $('cv'), cx = cv.getContext('2d');
@@ -658,7 +1075,8 @@ function draw(){
     ox.strokeRect(a.x,a.y,b.x-a.x,b.y-a.y); ox.setLineDash([]);
     return;
   }
-  const list = selStrips();
+  if (WIND.hover || windOn()) drawWindGuides(ink, paper);
+  const list = windOn() ? [] : selStrips();
   if (list.length){
     ox.save(); ox.translate(OFX,OFY); ox.scale(K,K);
     for (const s of list){
@@ -787,6 +1205,7 @@ STG.addEventListener('wheel', e=>{
 
 STG.addEventListener('pointerdown', e=>{
   if (e.button!==0 || !onStage(e)) return;
+  if (windOn()){ toast('Stop the wind to edit strips'); return; }
   const p=toLogical(e); STG.setPointerCapture(e.pointerId);
   if (frameMode){ const im=imgById(frameMode); drag={type:'frame',im,ox:im.ox,oy:im.oy,sx:p.x,sy:p.y}; return; }
   const add = e.shiftKey, sub = e.altKey;
@@ -834,7 +1253,7 @@ function startMarquee(p, add, sub){
 }
 
 STG.addEventListener('pointermove', e=>{
-  if (!drag){ if(!frameMode && onStage(e)){ const p=toLogical(e); STG.style.cursor = hitStrip(p.x,p.y)?'move':'crosshair'; } return; }
+  if (!drag){ if(!frameMode && !windOn() && onStage(e)){ const p=toLogical(e); STG.style.cursor = hitStrip(p.x,p.y)?'move':'crosshair'; } return; }
   const p=toLogical(e);
   if (drag.type==='frame'){ drag.im.ox = drag.ox+(p.x-drag.sx); drag.im.oy = drag.oy+(p.y-drag.sy); draw(); return; }
   if (drag.type==='pending'){
@@ -910,7 +1329,7 @@ document.addEventListener('keydown', e=>{
 const CTX=$('ctx');
 STG.addEventListener('contextmenu', e=>{
   if (!onStage(e)) return;
-  e.preventDefault(); if (frameMode) return;
+  e.preventDefault(); if (frameMode || windOn()) return;
   const p=toLogical(e); const s=hitStrip(p.x,p.y); if(!s){ hideCtx(); return; }
   if (!SEL.has(s.id)) setSel([s.id]);          /* right-click outside the selection re-selects */
   refreshSel(); draw();
@@ -1016,7 +1435,7 @@ function renderSrcEdit(){
     <input type="range" id="eRough" min="0" max="100" value="${im.rough}" ${im.edge!=='torn'?'hidden':''}>
     <div class="row" style="margin-top:6px"><label class="toggle"><input type="checkbox" id="eBW" ${im.bw?'checked':''}>Black &amp; white</label></div>`;
   const ch=(fn)=>{ fn(); rebuild(); pushHist(); };
-  $('eFrame').onclick=()=>{ frameMode = frameMode===im.id ? null : im.id; SEL.clear(); if(!frameMode){ rebuildLive(); pushHist(); } refreshAll(); };
+  $('eFrame').onclick=()=>{ if (windOn()){ toast('Stop the wind to adjust framing'); return; } frameMode = frameMode===im.id ? null : im.id; SEL.clear(); if(!frameMode){ rebuildLive(); pushHist(); } refreshAll(); };
   $('eFill').onclick=()=>{ im.ox=im.oy=0; im.zoom=1; rebuildLive(); pushHist(); refreshAll(); };
   $('eFit').onclick=()=>{ im.ox=im.oy=0; im.zoom=Math.min(S.W/im.iw,S.H/im.ih)/Math.max(S.W/im.iw,S.H/im.ih); rebuildLive(); pushHist(); refreshAll(); };
   $('eZoom').oninput=e=>{ im.zoom=e.target.value/100; $('eZoomV').textContent=im.zoom.toFixed(2); draw(); };
@@ -1083,7 +1502,7 @@ function refreshStatus(){
   const seq=parseSeq(); $('seqInfo').textContent = S.images.length ? `${seq.map(id=>S.images.findIndex(i=>i.id===id)+1).join('-')} · ${S.strips.length} strips` : '—';
   const ratio=S.H/S.W; const w=S.expW, h=Math.round(w*ratio); $('printSize').textContent=`${w}×${h} · ${(w/S.dpi).toFixed(1)}×${(h/S.dpi).toFixed(1)} in`;
   const n=selCount();
-  $('hintR').textContent = frameMode ? 'FRAMING — drag to pan, scroll to resize' : (n===1?`1 STRIP`:n?`${n} STRIPS`:'');
+  $('hintR').textContent = frameMode ? 'FRAMING — drag to pan, scroll to resize' : windOn() ? `WIND ${WIND.mode==='pause'?'FROZEN':'BLOWING'} — stop to edit strips` : (n===1?`1 STRIP`:n?`${n} STRIPS`:'');
   $('layInfo').textContent = n ? `${n} SELECTED` : 'TOP → BOTTOM';
 }
 function refreshAll(){ refreshSources(); refreshSel(); refreshStatus(); draw(); }
@@ -1113,12 +1532,25 @@ $('expW').onchange=e=>{ S.expW=clamp(parseInt(e.target.value)||3000,200,12000); 
 $('dpi').onchange=e=>{ S.dpi=+e.target.value; refreshStatus(); };
 $('expBW').onchange=e=>S.expBW=e.target.checked; $('expTrans').onchange=e=>S.expTrans=e.target.checked;
 $('btnUndo').onclick=undo; $('btnRedo').onclick=redo;
+seg('pinSeg','p',()=>S.wind.pin,v=>{ S.wind.pin=v; pushHist(); draw(); });
+const wlive=(id,key,fmt)=>{ const el=$(id); el.addEventListener('input',()=>{ S.wind[key]=+el.value; $(id+'V').textContent=el.value; if(fmt) fmt(); draw(); }); el.addEventListener('change',()=>pushHist()); };
+const wArrow=()=>{ $('wArrow').style.transform=`rotate(${S.wind.dir}deg)`; };
+wlive('wDir','dir',wArrow); wlive('wStr','strength'); wlive('wGust','gust'); wlive('wStiff','stiff');
+$('wBack').oninput=e=>{ S.wind.back=e.target.value; draw(); }; $('wBack').onchange=()=>pushHist();
+$('wSel').onchange=e=>{ S.wind.selOnly=e.target.checked; if (WIND.mode==='run'||WIND.mode==='pause') WIND.scope = S.wind.selOnly ? new Set(SEL) : null; pushHist(); draw(); };
+$('btnWind').onclick=()=>{ (WIND.mode==='run'||WIND.mode==='pause') ? stopWind() : startWind(); };
+$('btnFreeze').onclick=freezeWind;
+$('windSec').addEventListener('pointerenter',()=>{ WIND.hover=true; draw(); });
+$('windSec').addEventListener('pointerleave',()=>{ WIND.hover=false; draw(); });
 function syncControls(){
   syncSeg('aspectSeg','a',S.aspect); $('customRow').hidden=S.aspect!=='custom'; $('cw').value=S.cw; $('ch').value=S.ch; $('seq').value=S.seq;
   const p=P(); const sv=(id,v)=>{ $(id).value=v; const o=$(id+'V'); if(o) o.textContent=v; };
   sv('overlap',p.overlap); sv('gap',p.gap); sv('gScale',p.gScale); sv('gX',p.gX); sv('gY',p.gY); $('autoMode').value=p.autoMode;
   syncSeg('texSeg','t',p.texture); $('texBlend').value=p.texBlend; sv('texAlpha',p.texAlpha);
   $('shOn').checked=p.shOn; $('shColor').value=p.shColor; $('shBlend').value=p.shBlend; sv('shAlpha',p.shAlpha); sv('shDist',p.shDist); sv('shBlur',p.shBlur);
+  S.wind = Object.assign({...WDEF}, S.wind); const w=S.wind;
+  syncSeg('pinSeg','p',w.pin); sv('wDir',w.dir); sv('wStr',w.strength); sv('wGust',w.gust); sv('wStiff',w.stiff); wArrow();
+  $('wBack').value=w.back; $('wSel').checked=w.selOnly;
   $('bgOn').checked=S.bgOn; $('bgColor').value=S.bg; syncSeg('fmtSeg','f',S.fmt); $('expW').value=S.expW; $('dpi').value=S.dpi; $('expBW').checked=S.expBW; $('expTrans').checked=S.expTrans;
 }
 
@@ -1138,7 +1570,7 @@ async function doExport(){
   try{
     const k=S.expW/S.W, W=Math.round(S.W*k), H=Math.round(S.H*k);
     const c=document.createElement('canvas'); c.width=W; c.height=H; const x=c.getContext('2d');
-    const fm=frameMode; frameMode=null; render(x,k,{transparent:S.fmt==='png'&&S.expTrans}); frameMode=fm;
+    const fm=frameMode; frameMode=null; render(x,k,{transparent:S.fmt==='png'&&S.expTrans, export:true}); frameMode=fm;
     let outCanvas=c;
     if (S.expBW){ const g=document.createElement('canvas'); g.width=W; g.height=H; const gx=g.getContext('2d'); gx.filter='grayscale(1)'; gx.drawImage(c,0,0); outCanvas=g; }
     if (S.fmt==='jpg' ){ const j=document.createElement('canvas'); j.width=W; j.height=H; const jx=j.getContext('2d'); jx.fillStyle=S.bgOn?S.bg:'#ffffff'; jx.fillRect(0,0,W,H); jx.drawImage(outCanvas,0,0); outCanvas=j; }
